@@ -1,5 +1,6 @@
 const jwt = require('jsonwebtoken');
-const Admin = require('../models/Admin');
+const bcrypt = require('bcryptjs');
+const supabase = require('../config/supabase');
 
 const generateToken = (id) => {
   return jwt.sign({ id }, process.env.JWT_SECRET, {
@@ -13,20 +14,30 @@ const generateToken = (id) => {
 const authAdmin = async (req, res, next) => {
   try {
     const { email, password } = req.body;
-    const admin = await Admin.findOne({ email });
 
-    if (admin && (await admin.matchPassword(password))) {
+    const { data: admin, error } = await supabase
+      .from('admins')
+      .select('*')
+      .eq('email', email)
+      .maybeSingle();
+
+    if (error) {
+      res.status(500);
+      throw error;
+    }
+
+    if (admin && (await bcrypt.compare(password, admin.password))) {
       res.json({
-        _id: admin._id,
+        _id: admin.id,
         name: admin.name,
         email: admin.email,
-        token: generateToken(admin._id),
+        token: generateToken(admin.id),
       });
     } else {
       res.status(401);
       throw new Error('Invalid email or password');
     }
-  } catch(error) {
+  } catch (error) {
     next(error);
   }
 };
@@ -37,27 +48,49 @@ const authAdmin = async (req, res, next) => {
 const registerAdmin = async (req, res, next) => {
   try {
     const { name, email, password } = req.body;
-    const adminExists = await Admin.findOne({ email });
+
+    const { data: adminExists, error: checkError } = await supabase
+      .from('admins')
+      .select('*')
+      .eq('email', email)
+      .maybeSingle();
+
+    if (checkError) {
+      res.status(500);
+      throw checkError;
+    }
 
     if (adminExists) {
       res.status(400);
       throw new Error('Admin already exists');
     }
 
-    const admin = await Admin.create({ name, email, password });
+    const salt = await bcrypt.genSalt(10);
+    const hashedPassword = await bcrypt.hash(password, salt);
+
+    const { data: admin, error: createError } = await supabase
+      .from('admins')
+      .insert({ name: name || 'Admin', email, password: hashedPassword })
+      .select()
+      .single();
+
+    if (createError) {
+      res.status(400);
+      throw createError;
+    }
 
     if (admin) {
       res.status(201).json({
-        _id: admin._id,
+        _id: admin.id,
         name: admin.name,
         email: admin.email,
-        token: generateToken(admin._id),
+        token: generateToken(admin.id),
       });
     } else {
       res.status(400);
       throw new Error('Invalid admin data');
     }
-  } catch(error) {
+  } catch (error) {
     next(error);
   }
 };

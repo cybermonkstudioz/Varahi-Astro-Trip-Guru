@@ -1,5 +1,5 @@
 const jwt = require('jsonwebtoken');
-const Admin = require('../models/Admin');
+const supabase = require('../config/supabase');
 
 const protect = async (req, res, next) => {
   let token;
@@ -11,7 +11,23 @@ const protect = async (req, res, next) => {
     try {
       token = req.headers.authorization.split(' ')[1];
       const decoded = jwt.verify(token, process.env.JWT_SECRET);
-      req.admin = await Admin.findById(decoded.id).select('-password');
+      
+      const { data: admin, error } = await supabase
+        .from('admins')
+        .select('id, email, name, "createdAt", "updatedAt"')
+        .eq('id', decoded.id)
+        .single();
+
+      if (error || !admin) {
+        res.status(401);
+        return next(new Error('Not authorized, token failed'));
+      }
+
+      // Map UUID to _id to keep compatibility with existing mongoose usage
+      req.admin = {
+        ...admin,
+        _id: admin.id
+      };
       next();
     } catch (error) {
       console.error(error);

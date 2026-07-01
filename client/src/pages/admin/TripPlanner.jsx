@@ -3,13 +3,16 @@ import { useJsApiLoader } from '@react-google-maps/api';
 import TripForm from '../../components/trip/TripForm';
 import MapDisplay from '../../components/trip/MapDisplay';
 import CostPanel from '../../components/trip/CostPanel';
-import POIRecommendations from '../../components/trip/POIRecommendations';
 import TripManifestPDF from '../../components/trip/TripManifestPDF';
 import { Download, Share2, AlertCircle } from 'lucide-react';
 import html2canvas from 'html2canvas';
 import { jsPDF } from 'jspdf';
+import { geocodeAddress } from '../../utils/geocoder';
 
-const libraries = ['marker'];
+if (!window.GOOGLE_MAPS_LIBRARIES) {
+  window.GOOGLE_MAPS_LIBRARIES = ['marker', 'places'];
+}
+const libraries = window.GOOGLE_MAPS_LIBRARIES;
 
 const TripPlanner = () => {
   const { isLoaded, loadError } = useJsApiLoader({
@@ -74,23 +77,73 @@ const TripPlanner = () => {
   };
 
   const handleFetchRoute = async () => {
-    if (!tripData.sourceCoords || !tripData.destinationCoords) {
-      setError("Please ensure both source and destination are correctly selected from the dropdown.");
-      return false;
-    }
+    let srcCoords = tripData.sourceCoords;
+    let destCoords = tripData.destinationCoords;
+    let updatedTripData = { ...tripData };
+    let hasUpdates = false;
 
     try {
       setLoading(prev => ({ ...prev, route: true }));
       setError('');
-      
+
+      if (!srcCoords && tripData.source) {
+        const resolved = await geocodeAddress(tripData.source);
+        if (resolved) {
+          srcCoords = { lat: resolved.lat, lon: resolved.lon };
+          updatedTripData.source = resolved.name;
+          updatedTripData.sourceCoords = srcCoords;
+          hasUpdates = true;
+        }
+      }
+
+      if (!destCoords && tripData.destination) {
+        const resolved = await geocodeAddress(tripData.destination);
+        if (resolved) {
+          destCoords = { lat: resolved.lat, lon: resolved.lon };
+          updatedTripData.destination = resolved.name;
+          updatedTripData.destinationCoords = destCoords;
+          hasUpdates = true;
+        }
+      }
+
+      // Check for stops coordinates too
+      if (tripData.stops && tripData.stops.length > 0) {
+        const stopsCoordsCopy = [...(tripData.stopsCoords || [])];
+        const stopsCopy = [...tripData.stops];
+        for (let i = 0; i < tripData.stops.length; i++) {
+          if (!stopsCoordsCopy[i] && tripData.stops[i]) {
+            const resolved = await geocodeAddress(tripData.stops[i]);
+            if (resolved) {
+              stopsCoordsCopy[i] = { lat: resolved.lat, lon: resolved.lon };
+              stopsCopy[i] = resolved.name;
+              hasUpdates = true;
+            }
+          }
+        }
+        if (hasUpdates) {
+          updatedTripData.stops = stopsCopy;
+          updatedTripData.stopsCoords = stopsCoordsCopy;
+        }
+      }
+
+      if (hasUpdates) {
+        setTripData(updatedTripData);
+      }
+
+      if (!srcCoords || !destCoords) {
+        setError("Could not resolve coordinates for source or destination address. Please verify spelling or select from suggestions.");
+        setLoading(prev => ({ ...prev, route: false }));
+        return false;
+      }
+
       // Build OSRM coordinates string: lon,lat;lon,lat;...
       const coords = [];
-      coords.push(`${tripData.sourceCoords.lon},${tripData.sourceCoords.lat}`);
+      coords.push(`${srcCoords.lon},${srcCoords.lat}`);
       
-      const validStops = (tripData.stopsCoords || []).filter(c => c && c.lat && c.lon);
+      const validStops = (updatedTripData.stopsCoords || []).filter(c => c && c.lat && c.lon);
       validStops.forEach(c => coords.push(`${c.lon},${c.lat}`));
       
-      coords.push(`${tripData.destinationCoords.lon},${tripData.destinationCoords.lat}`);
+      coords.push(`${destCoords.lon},${destCoords.lat}`);
 
       const url = `https://router.project-osrm.org/route/v1/driving/${coords.join(';')}?overview=full&geometries=polyline&steps=true`;
       
@@ -109,13 +162,14 @@ const TripPlanner = () => {
       const durationMinutes = Math.round(route.duration / 60);
 
       let durStr = `${Math.floor(durationMinutes/60)} h ${durationMinutes%60} m`;
-      if (tripData.type === 'Round') durStr = `(One Way) ${durStr}`;
+      if (updatedTripData.type === 'Round') durStr = `(One Way) ${durStr}`;
 
       let actualDistance = distanceKm;
-      if (tripData.type === 'Round') actualDistance *= 2;
+      if (updatedTripData.type === 'Round') actualDistance *= 2;
 
       const suggestedDays = Math.max(1, Math.ceil(actualDistance / 250));
-      setTripData(prev => ({ ...prev, days: suggestedDays }));
+      updatedTripData.days = suggestedDays;
+      setTripData(updatedTripData);
 
       // Decode the polyline geometry for map display
       const routePath = decodePolyline(route.geometry);
@@ -125,8 +179,8 @@ const TripPlanner = () => {
         distance: distanceKm,
         duration: durationMinutes,
         durationStr: durStr,
-        origin: { lat: tripData.sourceCoords.lat, lng: tripData.sourceCoords.lon },
-        destination: { lat: tripData.destinationCoords.lat, lng: tripData.destinationCoords.lon },
+        origin: { lat: srcCoords.lat, lng: srcCoords.lon },
+        destination: { lat: destCoords.lat, lng: destCoords.lon },
         waypoints: validStops.map(c => ({ lat: c.lat, lng: c.lon })),
       });
       setManifestResult(null);
@@ -313,9 +367,6 @@ const TripPlanner = () => {
            <MapDisplay mapResult={routeResult} tripData={tripData} isLoaded={isLoaded} />
         </div>
       </div>
-      
-      {/* Route Intelligence POI Recommendations */}
-      {manifestResult && <POIRecommendations tripData={tripData} mapResult={manifestResult} />}
     </div>
   );
 };

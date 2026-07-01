@@ -1,13 +1,24 @@
 import { useState, useRef, useEffect, useCallback } from 'react';
 import { MapPin, Calendar, Users, Car, Plus, Trash2, ArrowRight, ArrowLeft, CheckCircle2, UtensilsCrossed, ParkingCircle, Hotel, Flame, Clock, FileText } from 'lucide-react';
+import { geocodeAddress, fetchPhoton, fetchPlaceDetails } from '../../utils/geocoder';
 
-// Custom autocomplete using Nominatim (free OpenStreetMap geocoding)
-const PlacesAutocompleteInput = ({ value, onChange, onCoordinates, placeholder, disabled, className }) => {
+// Custom autocomplete using Google Places API (with Photon fallback)
+const PlacesAutocompleteInput = ({ value, onChange, onCoordinates, coordinates, placeholder, disabled, className }) => {
   const [suggestions, setSuggestions] = useState([]);
   const [showDropdown, setShowDropdown] = useState(false);
   const [loading, setLoading] = useState(false);
   const debounceRef = useRef(null);
   const wrapperRef = useRef(null);
+  const autocompleteServiceRef = useRef(null);
+  const geocoderRef = useRef(null);
+
+  // Initialize Google Maps services if available
+  useEffect(() => {
+    if (window.google && window.google.maps && window.google.maps.places) {
+      autocompleteServiceRef.current = new window.google.maps.places.AutocompleteService();
+      geocoderRef.current = new window.google.maps.Geocoder();
+    }
+  }, []);
 
   // Close dropdown on outside click
   useEffect(() => {
@@ -20,27 +31,58 @@ const PlacesAutocompleteInput = ({ value, onChange, onCoordinates, placeholder, 
     return () => document.removeEventListener('mousedown', handleClickOutside);
   }, []);
 
+  const searchPhotonFallback = useCallback(async (query) => {
+    try {
+      const suggestionsList = await fetchPhoton(query);
+      setSuggestions(suggestionsList || []);
+      setShowDropdown((suggestionsList || []).length > 0);
+    } catch (err) {
+      console.error('Photon search fallback error:', err);
+      setSuggestions([]);
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
   const searchPlaces = useCallback(async (query) => {
     if (!query || query.length < 3) {
       setSuggestions([]);
       return;
     }
     setLoading(true);
-    try {
-      const res = await fetch(
-        `https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(query)}&countrycodes=in&limit=5&addressdetails=1`,
-        { headers: { 'Accept-Language': 'en' } }
-      );
-      const data = await res.json();
-      setSuggestions(data);
-      setShowDropdown(data.length > 0);
-    } catch (err) {
-      console.error('Nominatim search error:', err);
-      setSuggestions([]);
-    } finally {
-      setLoading(false);
+
+    // Re-attempt Google services initialization if google loaded late
+    if (!autocompleteServiceRef.current && window.google && window.google.maps && window.google.maps.places) {
+      autocompleteServiceRef.current = new window.google.maps.places.AutocompleteService();
+      geocoderRef.current = new window.google.maps.Geocoder();
     }
-  }, []);
+
+    if (autocompleteServiceRef.current) {
+      try {
+        autocompleteServiceRef.current.getPlacePredictions(
+          { 
+            input: query, 
+            componentRestrictions: { country: 'in' } // Restrict searches to India to prioritize local Tamil Nadu results
+          },
+          (predictions, status) => {
+            if (status === window.google.maps.places.PlacesServiceStatus.OK && predictions && predictions.length > 0) {
+              setLoading(false);
+              setSuggestions(predictions);
+              setShowDropdown(true);
+            } else {
+              console.warn(`Google Autocomplete predictions failed with status: ${status}. Trying Photon fallback...`);
+              searchPhotonFallback(query);
+            }
+          }
+        );
+      } catch (err) {
+        console.error('Google Autocomplete Service exception:', err);
+        searchPhotonFallback(query);
+      }
+    } else {
+      searchPhotonFallback(query);
+    }
+  }, [searchPhotonFallback]);
 
   const handleInputChange = (e) => {
     const val = e.target.value;
@@ -51,14 +93,59 @@ const PlacesAutocompleteInput = ({ value, onChange, onCoordinates, placeholder, 
     debounceRef.current = setTimeout(() => searchPlaces(val), 400);
   };
 
-  const handleSelect = (place) => {
-    const displayName = place.display_name.split(',').slice(0, 3).join(',');
-    onChange(displayName);
-    if (onCoordinates) {
-      onCoordinates({ lat: parseFloat(place.lat), lon: parseFloat(place.lon) });
-    }
+  const handleSelect = async (place) => {
+    onChange(place.description);
     setShowDropdown(false);
     setSuggestions([]);
+
+    if (!onCoordinates) return;
+
+    if (place.isPhoton) {
+      onCoordinates({ lat: parseFloat(place.lat), lon: parseFloat(place.lon) });
+    } else if (place.isOla) {
+      try {
+        const details = await fetchPlaceDetails(place.place_id);
+        if (details && details.lat && details.lon) {
+          onCoordinates({ lat: parseFloat(details.lat), lon: parseFloat(details.lon) });
+        } else {
+          console.error('Ola Maps Details failed to return coordinates');
+        }
+      } catch (err) {
+        console.error('Ola Maps Details error:', err);
+      }
+    } else if (geocoderRef.current) {
+      geocoderRef.current.geocode({ placeId: place.place_id }, (results, status) => {
+        if (status === 'OK' && results[0]) {
+          const loc = results[0].geometry.location;
+          onCoordinates({ lat: loc.lat(), lon: loc.lng() });
+        } else {
+          console.error('Google Geocoding failed due to: ' + status);
+        }
+      });
+    }
+  };
+
+  const handleBlur = () => {
+    setTimeout(async () => {
+      setShowDropdown(false);
+      // Resolve text to coordinates on input blur if not yet set
+      if (value && !coordinates && onCoordinates) {
+        setLoading(true);
+        const resolved = await geocodeAddress(value);
+        setLoading(false);
+        if (resolved) {
+          onCoordinates({ lat: resolved.lat, lon: resolved.lon });
+          onChange(resolved.name);
+        }
+      }
+    }, 300);
+  };
+
+  const handleKeyDown = (e) => {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      e.target.blur(); // Triggers handleBlur for coordinates resolution
+    }
   };
 
   return (
@@ -67,6 +154,8 @@ const PlacesAutocompleteInput = ({ value, onChange, onCoordinates, placeholder, 
         type="text"
         value={value}
         onChange={handleInputChange}
+        onBlur={handleBlur}
+        onKeyDown={handleKeyDown}
         onFocus={() => suggestions.length > 0 && setShowDropdown(true)}
         className={className || "w-full bg-[#0B1221] border border-white/5 text-white rounded-lg py-2.5 pl-10 pr-3 text-sm focus:outline-none focus:border-[#D4AF37]"}
         placeholder={placeholder}
@@ -83,14 +172,15 @@ const PlacesAutocompleteInput = ({ value, onChange, onCoordinates, placeholder, 
           )}
           {suggestions.map((place, i) => (
             <button
-              key={place.place_id || i}
+              key={`${place.place_id || 'place'}-${i}`}
+              type="button"
               onClick={() => handleSelect(place)}
               className="w-full text-left px-4 py-3 hover:bg-[#D4AF37]/10 transition-colors border-b border-white/5 last:border-b-0 flex items-start gap-3"
             >
               <MapPin size={14} className="text-[#D4AF37] mt-0.5 shrink-0" />
               <div>
-                <p className="text-white text-sm font-medium">{place.display_name.split(',').slice(0, 2).join(',')}</p>
-                <p className="text-gray-500 text-xs mt-0.5 line-clamp-1">{place.display_name}</p>
+                <p className="text-white text-sm font-medium">{place.structured_formatting?.main_text || place.description}</p>
+                <p className="text-gray-500 text-xs mt-0.5 line-clamp-1">{place.structured_formatting?.secondary_text || place.description}</p>
               </div>
             </button>
           ))}
@@ -101,9 +191,9 @@ const PlacesAutocompleteInput = ({ value, onChange, onCoordinates, placeholder, 
 };
 
 // Shared input class
-const inputCls = "w-full bg-[#0B1221] border border-white/5 text-white rounded-lg py-2.5 px-3 text-sm focus:outline-none focus:border-[#D4AF37]";
-const inputClsIcon = "w-full bg-[#0B1221] border border-white/5 text-white rounded-lg py-2.5 pl-10 pr-3 text-sm focus:outline-none focus:border-[#D4AF37]";
-const sectionTitle = "text-xs font-semibold text-[#D4AF37] mb-3 uppercase tracking-wider flex items-center gap-2";
+const inputCls = "w-full bg-[#0B1221] border border-white/10 text-white rounded-xl py-3 px-4 text-sm focus:outline-none focus:border-[#D4AF37] focus:ring-1 focus:ring-[#D4AF37]/20 transition-all font-medium placeholder-gray-600";
+const inputClsIcon = "w-full bg-[#0B1221] border border-white/10 text-white rounded-xl py-3 pl-11 pr-4 text-sm focus:outline-none focus:border-[#D4AF37] focus:ring-1 focus:ring-[#D4AF37]/20 transition-all font-medium placeholder-gray-600";
+const sectionTitle = "text-xs font-extrabold text-[#D4AF37] mb-4 uppercase tracking-widest flex items-center gap-2 font-mono";
 
 const TripForm = ({ tripData, setTripData, onFetchRoute, onGenerateManifest, loading }) => {
   const [step, setStep] = useState(1);
@@ -177,12 +267,12 @@ const TripForm = ({ tripData, setTripData, onFetchRoute, onGenerateManifest, loa
 
   const StepIndicator = () => (
     <div className="flex items-center justify-between mb-8 relative px-2 mt-4">
-      <div className="absolute left-2 right-2 top-1/2 -translate-y-1/2 h-0.5 bg-white/10 z-0"></div>
-      <div className="absolute left-2 top-1/2 -translate-y-1/2 h-0.5 bg-[#D4AF37] z-0 transition-all duration-300" style={{ width: `calc(${((step - 1) / (totalSteps - 1)) * 100}% - 16px)` }}></div>
+      <div className="absolute left-2 right-2 top-1/2 -translate-y-1/2 h-[3px] bg-white/5 z-0 rounded-full"></div>
+      <div className="absolute left-2 top-1/2 -translate-y-1/2 h-[3px] bg-gradient-to-r from-[#D4AF37] to-[#F2CD5C] z-0 transition-all duration-500 rounded-full shadow-[0_0_8px_rgba(212,175,55,0.3)]" style={{ width: `calc(${((step - 1) / (totalSteps - 1)) * 100}% - 16px)` }}></div>
 
       {Array.from({ length: totalSteps }, (_, i) => i + 1).map(num => (
-        <div key={num} className={`relative z-10 flex items-center justify-center w-8 h-8 rounded-full text-xs font-bold border-2 transition-all duration-300 ${step >= num ? 'bg-[#D4AF37] border-[#D4AF37] text-[#0B1221]' : 'bg-[#0B1221] border-white/20 text-gray-500'}`}>
-          {step > num ? <CheckCircle2 size={16} /> : num}
+        <div key={num} className={`relative z-10 flex items-center justify-center w-9 h-9 rounded-full text-xs font-extrabold border-2 transition-all duration-500 shadow-md ${step >= num ? 'bg-gradient-to-br from-[#D4AF37] to-[#F2CD5C] border-[#D4AF37] text-[#0B1221] scale-110 shadow-[0_0_12px_rgba(212,175,55,0.25)]' : 'bg-[#0B1221] border-white/10 text-gray-500'}`}>
+          {step > num ? <CheckCircle2 size={16} className="stroke-[2.5]" /> : num}
         </div>
       ))}
     </div>
@@ -190,20 +280,20 @@ const TripForm = ({ tripData, setTripData, onFetchRoute, onGenerateManifest, loa
 
   // Navigation buttons
   const NavButtons = ({ nextDisabled, isLast }) => (
-    <div className="flex gap-3 pt-2 mt-auto">
+    <div className="flex gap-3 pt-4 mt-auto">
       {step > 1 && (
-        <button onClick={handleBack} className="px-5 py-2.5 bg-[#0B1221] border border-white/10 text-white rounded-lg font-semibold text-sm hover:bg-white/5 transition-colors flex items-center justify-center"><ArrowLeft size={16} /></button>
+        <button onClick={handleBack} className="px-5 py-3 bg-[#0B1221] border border-white/10 text-white rounded-xl font-bold text-sm hover:bg-white/5 transition-all flex items-center justify-center"><ArrowLeft size={16} /></button>
       )}
       {isLast ? (
         <button
           onClick={onGenerateManifest}
           disabled={loading?.manifest || !tripData.vehicle.name || !tripData.vehicle.rate}
-          className="flex-1 py-2.5 bg-gradient-to-r from-[#D4AF37] to-[#F2CD5C] text-[#0B1221] rounded-lg font-bold text-sm hover:shadow-lg transition-all flex justify-center items-center gap-2 cursor-pointer disabled:opacity-50"
+          className="flex-1 py-3 bg-gradient-to-r from-[#D4AF37] to-[#F2CD5C] text-[#0B1221] rounded-xl font-extrabold text-sm hover:shadow-[0_0_15px_rgba(212,175,55,0.3)] transition-all flex justify-center items-center gap-2 cursor-pointer disabled:opacity-50"
         >
           {loading?.manifest ? <span className="animate-pulse">Generating Manifest...</span> : 'Generate Manifest'}
         </button>
       ) : (
-        <button onClick={step === 1 ? handleNext1 : handleNext} disabled={nextDisabled} className="flex-1 py-2.5 bg-[#D4AF37] text-[#0B1221] rounded-lg font-semibold text-sm hover:bg-[#F2CD5C] transition-colors flex justify-center items-center gap-2 disabled:opacity-50">
+        <button onClick={step === 1 ? handleNext1 : handleNext} disabled={nextDisabled} className="flex-1 py-3 bg-[#D4AF37] text-[#0B1221] rounded-xl font-bold text-sm hover:bg-[#F2CD5C] transition-all flex justify-center items-center gap-2 disabled:opacity-50 hover:shadow-[0_0_10px_rgba(212,175,55,0.15)]">
           {step === 1 && loading?.route ? 'Decoding Routes...' : <>Continue <ArrowRight size={16} /></>}
         </button>
       )}
@@ -211,10 +301,12 @@ const TripForm = ({ tripData, setTripData, onFetchRoute, onGenerateManifest, loa
   );
 
   return (
-    <div className="bg-[#111C35] rounded-xl border border-white/5 p-6 shrink-0 w-full shadow-lg min-h-[460px] flex flex-col">
-      <div className="flex justify-between items-center mb-2">
-        <h3 className="text-sm font-semibold text-white uppercase tracking-wider">Configure Manifest</h3>
-        <span className="text-xs font-bold text-[#D4AF37]">Step {step} of {totalSteps}</span>
+    <div className="glass-panel rounded-2xl p-6 shrink-0 w-full shadow-xl min-h-[460px] flex flex-col relative overflow-hidden">
+      <div className="absolute -top-24 -left-24 w-48 h-48 bg-[#D4AF37]/5 rounded-full filter blur-3xl pointer-events-none"></div>
+      
+      <div className="flex justify-between items-center mb-2 relative z-10">
+        <h3 className="text-sm font-extrabold text-white uppercase tracking-wider">Configure Manifest</h3>
+        <span className="text-xs font-bold text-[#D4AF37] bg-[#D4AF37]/10 px-2.5 py-1 rounded-lg">Step {step} of {totalSteps}</span>
       </div>
 
       <StepIndicator />
@@ -244,6 +336,7 @@ const TripForm = ({ tripData, setTripData, onFetchRoute, onGenerateManifest, loa
                     value={tripData.source}
                     onChange={(val) => setTripData(prev => ({ ...prev, source: val }))}
                     onCoordinates={(coords) => setTripData(prev => ({ ...prev, sourceCoords: coords }))}
+                    coordinates={tripData.sourceCoords}
                     placeholder="e.g. New Delhi"
                     disabled={false}
                     className={inputClsIcon}
@@ -260,6 +353,7 @@ const TripForm = ({ tripData, setTripData, onFetchRoute, onGenerateManifest, loa
                       value={stop}
                       onChange={(val) => updateStop(i, val)}
                       onCoordinates={(coords) => updateStopCoords(i, coords)}
+                      coordinates={tripData.stopsCoords?.[i] || null}
                       placeholder="Intermediate city"
                       disabled={false}
                       className="w-full bg-[#0B1221] border border-white/5 text-white rounded-lg py-2 px-3 text-sm focus:outline-none focus:border-[#D4AF37]"
@@ -281,6 +375,7 @@ const TripForm = ({ tripData, setTripData, onFetchRoute, onGenerateManifest, loa
                     value={tripData.destination}
                     onChange={(val) => setTripData(prev => ({ ...prev, destination: val }))}
                     onCoordinates={(coords) => setTripData(prev => ({ ...prev, destinationCoords: coords }))}
+                    coordinates={tripData.destinationCoords}
                     placeholder="e.g. Jaipur"
                     disabled={false}
                     className={inputClsIcon}
@@ -289,7 +384,7 @@ const TripForm = ({ tripData, setTripData, onFetchRoute, onGenerateManifest, loa
               </div>
             </div>
 
-            <NavButtons nextDisabled={!tripData.source || !tripData.destination || !tripData.sourceCoords || !tripData.destinationCoords || loading?.route} />
+            <NavButtons nextDisabled={!tripData.source || !tripData.destination || loading?.route} />
           </div>
         )}
 
@@ -374,7 +469,7 @@ const TripForm = ({ tripData, setTripData, onFetchRoute, onGenerateManifest, loa
               </div>
 
               <div className="col-span-2 mt-1 pt-3 border-t border-white/5">
-                <h4 className={sectionTitle}>Extra Trip Charges</h4>
+                <h4 className={sectionTitle}>Trip Charges</h4>
                 <div className="grid grid-cols-2 gap-3">
                   <div className="col-span-1">
                     <label className="block text-xs font-medium text-gray-400 mb-1.5">Trip Assist (₹)</label>
