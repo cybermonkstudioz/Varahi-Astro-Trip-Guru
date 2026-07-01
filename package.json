@@ -4,9 +4,12 @@
   "description": "Trip Planner with client and server",
   "scripts": {
     "dev": "npm run install-all && concurrently \"npm run dev --prefix server\" \"npm run dev --prefix client\"",
-    "install-all": "npm install && npm install --prefix server && npm install --prefix client"
+    "install-all": "npm install && npm install --prefix server && npm install --prefix client",
+    "deploy": "wrangler deploy",
+    "preview": "wrangler dev"
   },
   "devDependencies": {
-    "concurrently": "^8.2.2"
+    "concurrently": "^8.2.2",
+    "wrangler": "^4.106.0"
   }
 }
